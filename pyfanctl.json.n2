@@ -1,0 +1,12 @@
+{
+    "cpufan": {
+        "chip": "it8613",
+        "index": 3,
+        "presets": {
+            "normal": [32, 32, 240],
+            "increased": [40, 48, 250],
+            "silent": [22, 30, 250]
+        },
+        "sensors": {"coretemp": {"thresholds": [50, 55, 90]}}
+    }
+}

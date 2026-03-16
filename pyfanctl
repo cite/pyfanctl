@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+
+import json
+import signal
+import time
+
+from pathlib import Path
+
+
+# TODO: make this configurable, too
+PWM_STEP = 4
+RAMP_UP_RATE = (PWM_STEP * 5)
+RAMP_DOWN_RATE = PWM_STEP
+STEP = 2
+HOLD_ITERATIONS = 15
+
+
+def find_hwmon_dir(chip="it8613", hwmon_root="/sys/class/hwmon"):
+    hwmon_root = Path(hwmon_root)
+
+    d = []
+    for hwmon_dir in sorted(hwmon_root.glob("hwmon*")):
+        name_file = hwmon_dir / "name"
+        if not name_file.is_file():
+            continue
+
+        try:
+            name = name_file.read_text().strip()
+        except OSError:
+            continue
+
+        if name == chip:
+            d.append(hwmon_dir)
+
+    return d
+
+
+def install_signal_handler(config):
+    def _on_exit(signum, frame):
+        try:
+            for _, params in config.items():
+                Path(f"{params['path']}_enable").write_text("2\n")
+        finally:
+            raise SystemExit(0) 
+
+    signal.signal(signal.SIGTERM, _on_exit)
+    signal.signal(signal.SIGINT, _on_exit)
+
+
+def read_temp(sensor):
+    temps = []
+    for d in sensor["path"]:
+        for f in d.glob("temp*_input"):
+            try:
+                temps.append(int(f.read_text().strip()) / 1000)
+            except OSError:
+                continue
+    return max(temps)
+
+
+def set_fanspeed(fan, speed):
+    config[fan]["path"].write_text(f"{speed}\n")
+
+
+def align_pwm(value, pwm_step=PWM_STEP):
+    return pwm_step * round(value / pwm_step)
+
+
+def compute_target_pwm(temp, idle_pwm, spinup_pwm, max_pwm, _, spinup_temp, max_temp):
+    if temp <= spinup_temp:
+        return align_pwm(idle_pwm)
+    if temp >= max_temp:
+        return align_pwm(max_pwm)
+    fraction = (temp - spinup_temp) / (max_temp - spinup_temp)
+    return align_pwm(int(spinup_pwm + fraction * (max_pwm - spinup_pwm)))
+
+
+# load configuration from file
+config = json.load(Path("/etc/pyfanctl.json").open())
+# add paths to configuration
+# TODO: it seems very wrong to use the configuration for runtime data storage
+for name, params in config.items():
+    if len((p := find_hwmon_dir(chip=params["chip"]))) == 1:
+        config[name]["path"] = Path(p[0] / f"pwm{params['index']}")
+
+        # enable PWM and set to a pretty high value, cause
+        # we don't know what state we're in
+        Path(p[0] / f"pwm{params['index']}_enable").write_text("1\n")
+        set_fanspeed(name, config[name]["presets"]["normal"][-1])
+
+        # add tracking variables
+        config[name]["current_pwm"] = align_pwm(params["presets"]["normal"][0])
+        config[name]["fans_active"] = False
+        config[name]["hold_counter"] = 0
+    else:
+        raise RuntimeError(
+            f"hwmon directory for fan {name}, chip {params['chip']} not found (or more than once)"
+        )
+    for chip, _ in params["sensors"].items():
+        if len((p := find_hwmon_dir(chip))) > 0:
+            config[name]["sensors"][chip]["path"] = p
+        else:
+            raise RuntimeError(f"hwmon directory for fan {chip} not found")
+
+# dynamic cooling
+cooling_preset = "normal"
+increased_cooling_flag = Path("/tmp/increased_cooling")
+silent_cooling_flag = Path("/tmp/silent_cooling")
+install_signal_handler(config)
+
+while True:
+    if increased_cooling_flag.exists():
+        cooling_preset = "increased"
+    elif silent_cooling_flag.exists():
+        cooling_preset = "silent"
+    else:
+        cooling_preset = "normal"
+
+    for fan, params in config.items():
+        spinup = 0  # count how many sensors would require spinup
+        spindown = 0  # count how many sensors are idle
+        pwms = []
+        for sensor, sensor_config in params["sensors"].items():
+            temp = read_temp(sensor_config)
+            if (
+                not config[name]["fans_active"]
+                and temp >= sensor_config["thresholds"][1]
+            ):
+                spinup += 1
+            elif config[name]["fans_active"] and temp <= sensor_config["thresholds"][0]:
+                spindown += 1
+            pwms.append(
+                compute_target_pwm(
+                    temp,
+                    *params["presets"][cooling_preset],
+                    *sensor_config["thresholds"],
+                )
+            )
+        if spinup >= 1:
+            config[name]["fans_active"] = True
+        elif spindown == len(params["sensors"].items()):
+            config[name]["fans_active"] = False
+
+        if config[name]["fans_active"]:
+            target_pwm = max(pwms)
+        else:
+            target_pwm = align_pwm(params["presets"][cooling_preset][0])
+
+        current_pwm = config[name]["current_pwm"]
+        hold_counter = config[name]["hold_counter"]
+        if target_pwm > current_pwm:
+            hold_counter = HOLD_ITERATIONS
+            current_pwm = align_pwm(min(target_pwm, current_pwm + RAMP_UP_RATE))
+        elif target_pwm < current_pwm:
+            if hold_counter > 0:
+                hold_counter -= 1
+            else:
+                current_pwm = align_pwm(max(target_pwm, current_pwm - RAMP_DOWN_RATE))
+                hold_counter = int(HOLD_ITERATIONS / 10)  # "10" is arbitrary
+        else:
+            hold_counter = HOLD_ITERATIONS
+
+        set_fanspeed(name, current_pwm)
+        config[name]["hold_counter"] = hold_counter
+        config[name]["current_pwm"] = current_pwm
+        time.sleep(STEP)

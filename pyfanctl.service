@@ -1,0 +1,10 @@
+[Unit]
+Description=Primitive Fan Contronl
+
+[Service]
+ExecStart=/usr/bin/python3 -u /usr/local/sbin/pyfanctl
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

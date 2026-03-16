@@ -1,0 +1,19 @@
+{
+    "sysfan": {
+        "chip": "it8613",
+        "index": 3,
+        "presets": {
+            "normal": [60, 70, 250],
+            "increased": [68, 70, 250],
+            "silent": [48, 70, 250]
+        },
+        "sensors": {
+            "coretemp": {
+                "thresholds": [54, 60, 90]
+            },
+            "drivetemp": {
+                "thresholds": [30, 35, 42]
+            }
+        }
+    }
+}
